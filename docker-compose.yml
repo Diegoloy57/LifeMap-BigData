@@ -1,11 +1,16 @@
+
 services:
+
+  # ==========================================================
+  # MONGODB - BASE DE DATOS INDEPENDIENTE DE LIFEMAP
+  # ==========================================================
 
   mongo:
     image: mongo:7.0
-    container_name: bigdata-mongo
+    container_name: lifemap-mongo
     restart: unless-stopped
     ports:
-      - "27017:27017"
+      - "27018:27017"
     volumes:
       - mongo_data:/data/db
     healthcheck:
@@ -15,134 +20,154 @@ services:
       retries: 5
 
 
+  # ==========================================================
+  # DASK - SCHEDULER
+  # ==========================================================
+
   dask-scheduler:
     build:
       context: .
       dockerfile: docker/dask.Dockerfile
-    container_name: bigdata-dask-scheduler
+    container_name: lifemap-dask-scheduler
     command: dask scheduler
     ports:
-      - "8786:8786"
-      - "8787:8787"
+      - "18786:8786"
+      - "18787:8787"
     depends_on:
       - mongo
 
+
+  # ==========================================================
+  # DASK - WORKER 1
+  # ==========================================================
 
   dask-worker-1:
     build:
       context: .
       dockerfile: docker/dask.Dockerfile
-    container_name: bigdata-dask-worker-1
-    command: dask worker tcp://dask-scheduler:8786 --nthreads 1 --memory-limit 2GB
+    container_name: lifemap-dask-worker-1
+    command: dask worker tcp://dask-scheduler:8786 --nthreads 1 --memory-limit 512MB
     volumes:
-      - type: volume
-        source: dataset_data
-        target: /app/data
-        volume:
-          nocopy: true
+      - ./data:/app/data
     depends_on:
       - dask-scheduler
 
+
+  # ==========================================================
+  # DASK - WORKER 2
+  # ==========================================================
 
   dask-worker-2:
     build:
       context: .
       dockerfile: docker/dask.Dockerfile
-    container_name: bigdata-dask-worker-2
-    command: dask worker tcp://dask-scheduler:8786 --nthreads 1 --memory-limit 2GB
+    container_name: lifemap-dask-worker-2
+    command: dask worker tcp://dask-scheduler:8786 --nthreads 1 --memory-limit 512MB
     volumes:
-      - type: volume
-        source: dataset_data
-        target: /app/data
-        volume:
-          nocopy: true
+      - ./data:/app/data
     depends_on:
       - dask-scheduler
 
+
+  # ==========================================================
+  # DASK - CLIENTE DE INGESTA YELP
+  # ==========================================================
 
   dask-client:
     build:
       context: .
       dockerfile: docker/dask.Dockerfile
-    container_name: bigdata-dask-client
-    command: >
-      sh -lc "
-      python scripts/download_dataset.py &&
-      python dask/ingest.py
-      "
+    container_name: lifemap-dask-client
+    command: python dask/ingest_yelp.py
     volumes:
-      - type: volume
-        source: dataset_data
-        target: /app/data
-        volume:
-          nocopy: true
+      - ./data:/app/data
+    environment:
+      - MONGO_URI=mongodb://mongo:27017
     depends_on:
-      - dask-scheduler
-      - dask-worker-1
-      - dask-worker-2
-      - mongo
+      mongo:
+        condition: service_healthy
 
+
+  # ==========================================================
+  # APACHE SPARK - MASTER
+  # ==========================================================
 
   spark-master:
     build:
       context: .
       dockerfile: docker/spark.Dockerfile
-    container_name: bigdata-spark-master
+    container_name: lifemap-spark-master
     command: >
       /opt/spark/bin/spark-class
       org.apache.spark.deploy.master.Master
     ports:
-      - "7077:7077"
-      - "8080:8080"
+      - "17077:7077"
+      - "18080:8080"
     depends_on:
       - mongo
 
+
+  # ==========================================================
+  # APACHE SPARK - WORKER
+  # ==========================================================
 
   spark-worker:
     build:
       context: .
       dockerfile: docker/spark.Dockerfile
-    container_name: bigdata-spark-worker
+    container_name: lifemap-spark-worker
     command: >
       /opt/spark/bin/spark-class
       org.apache.spark.deploy.worker.Worker
       spark://spark-master:7077
     environment:
       - SPARK_WORKER_MEMORY=1g
-      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_CORES=1
     depends_on:
       - spark-master
 
+
+  # ==========================================================
+  # FLASK API
+  # ==========================================================
 
   api:
     build:
       context: .
       dockerfile: docker/api.Dockerfile
-    container_name: bigdata-api
+    container_name: lifemap-api
     ports:
-      - "5000:5000"
+      - "5001:5000"
     environment:
       - MONGO_URI=mongodb://mongo:27017
     depends_on:
-      - mongo
+      mongo:
+        condition: service_healthy
     restart: unless-stopped
 
+
+  # ==========================================================
+  # JENKINS - CI/CD
+  # ==========================================================
 
   jenkins:
     build:
       context: .
       dockerfile: docker/jenkins.Dockerfile
-    container_name: bigdata-jenkins
+    container_name: lifemap-jenkins
     ports:
-      - "8081:8080"
-      - "50000:50000"
+      - "8082:8080"
+      - "50001:50000"
     volumes:
       - jenkins_home:/var/jenkins_home
       - /var/run/docker.sock:/var/run/docker.sock
     restart: unless-stopped
 
 
+# ============================================================
+# VOLUMENES INDEPENDIENTES
+# ============================================================
+
 volumes:
   mongo_data:
-  dataset_data:
   jenkins_home:

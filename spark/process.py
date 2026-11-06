@@ -1,249 +1,341 @@
+
+import os
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col,
+    split,
+    explode,
+    trim,
     count,
-    floor,
-    round as spark_round
+    sum as spark_sum,
+    when,
+    round as spark_round,
+    lit,
 )
 
 
 # ============================================================
-# CONFIGURACIÓN
+# LIFEMAP - PROCESAMIENTO SPARK
+# Estadísticas descriptivas de negocios Yelp
 # ============================================================
 
-MONGO_URI = "mongodb://mongo:27017"
+MONGO_URI = os.getenv(
+    "MONGO_URI",
+    "mongodb://mongo:27017"
+)
 
-DATABASE_NAME = "crime_db"
-SOURCE_COLLECTION = "crimes"
+DATABASE_NAME = "lifemap"
+SOURCE_COLLECTION = "businesses"
+RESULT_COLLECTION = "closure_stats"
 
-MONTHLY_COLLECTION = "crime_monthly_area_stats"
-GRID_COLLECTION = "crime_hotspots_grid"
+SELECTED_CITY = os.getenv(
+    "LIFEMAP_CITY",
+    "Philadelphia"
+)
 
 
 # ============================================================
-# CREAR SPARK SESSION
+# 1. CREAR SESIÓN SPARK
 # ============================================================
 
 spark = (
     SparkSession.builder
-    .appName("CrimeDataProcessing")
-    .master("spark://spark-master:7077")
+    .appName("LifeMapClosureAnalysis")
     .config(
         "spark.mongodb.read.connection.uri",
-        f"{MONGO_URI}/{DATABASE_NAME}.{SOURCE_COLLECTION}"
+        MONGO_URI
     )
     .config(
         "spark.mongodb.write.connection.uri",
-        f"{MONGO_URI}/{DATABASE_NAME}"
+        MONGO_URI
     )
+    .config("spark.sql.shuffle.partitions", "4")
     .getOrCreate()
 )
 
-# Reducimos ruido en consola
 spark.sparkContext.setLogLevel("WARN")
 
-
-print("========================================")
-print("     PROCESAMIENTO DISTRIBUIDO SPARK")
-print("========================================")
-
-
-# ============================================================
-# 1. LEER DESDE MONGODB
-# ============================================================
-
-print("\n1. Leyendo datos desde MongoDB...")
-
-df = (
-    spark.read
-    .format("mongodb")
-    .option("database", DATABASE_NAME)
-    .option("collection", SOURCE_COLLECTION)
-    .load()
-)
-
-total = df.count()
-
-print(f"Registros leídos: {total:,}")
+print("=" * 55)
+print("       LIFEMAP - ANALISIS CON APACHE SPARK")
+print("=" * 55)
 
 
-# ============================================================
-# 2. AGREGACIÓN TEMPORAL
-#    DELITOS POR AÑO, MES Y ÁREA
-# ============================================================
+try:
 
-print("\n2. Calculando agregación temporal...")
+    # ========================================================
+    # 2. LEER LOS NEGOCIOS DESDE MONGODB
+    # ========================================================
 
-monthly_stats = (
-    df
-    .filter(
-        col("occ_year").isNotNull()
-        & col("occ_month").isNotNull()
-        & col("area_name").isNotNull()
+    print("\n1. Leyendo negocios desde MongoDB...")
+
+    df = (
+        spark.read
+        .format("mongodb")
+        .option("database", DATABASE_NAME)
+        .option("collection", SOURCE_COLLECTION)
+        .load()
     )
-    .groupBy(
-        "occ_year",
-        "occ_month",
-        "area_name"
+
+    print(f"Negocios totales: {df.count():,}")
+
+    # ========================================================
+    # 3. FILTRAR FILADELFIA
+    # ========================================================
+
+    print(f"\n2. Filtrando ciudad: {SELECTED_CITY}")
+
+    city_df = (
+        df
+        .filter(col("city") == SELECTED_CITY)
+        .filter(col("business_id").isNotNull())
+        .filter(col("is_open").isin(0, 1))
+        .select(
+            "business_id",
+            "name",
+            "city",
+            "categories",
+            "is_open",
+            "stars",
+            "review_count"
+        )
+        .dropDuplicates(["business_id"])
+        .cache()
     )
-    .agg(
-        count("*").alias("total_crimes")
-    )
-    .orderBy(
-        "occ_year",
-        "occ_month",
-        col("total_crimes").desc()
-    )
-)
 
-print("\nMuestra de agregación temporal:")
+    total_city = city_df.count()
 
-monthly_stats.show(
-    20,
-    truncate=False
-)
+    print(f"Negocios válidos en {SELECTED_CITY}: {total_city:,}")
 
+    if total_city == 0:
+        raise ValueError(
+            "No hay negocios válidos para la ciudad seleccionada."
+        )
 
-# ============================================================
-# 3. GUARDAR AGREGACIÓN TEMPORAL EN MONGODB
-# ============================================================
+    # ========================================================
+    # 4. ESTADO GENERAL DE LOS NEGOCIOS
+    # ========================================================
 
-print(
-    f"\n3. Guardando resultados en "
-    f"{DATABASE_NAME}.{MONTHLY_COLLECTION}..."
-)
+    print("\n3. Calculando negocios abiertos y cerrados...")
 
-(
-    monthly_stats
-    .write
-    .format("mongodb")
-    .mode("overwrite")
-    .option("database", DATABASE_NAME)
-    .option("collection", MONTHLY_COLLECTION)
-    .save()
-)
-
-print("Agregación temporal guardada correctamente.")
-
-
-# ============================================================
-# 4. AGREGACIÓN ESPACIAL POR CUADRÍCULA
-# ============================================================
-
-print("\n4. Calculando hotspots por cuadrícula...")
-
-# Tamaño aproximado de celda:
-# 0.01 grados ≈ 1 km en latitud.
-#
-# La idea es agrupar delitos cercanos dentro
-# de una misma celda geográfica.
-GRID_SIZE = 0.01
-
-grid_df = (
-    df
-    .filter(
-        col("latitude").isNotNull()
-        & col("longitude").isNotNull()
-    )
-    .withColumn(
-        "grid_lat",
-        floor(
-            col("latitude") / GRID_SIZE
-        ) * GRID_SIZE
-    )
-    .withColumn(
-        "grid_lon",
-        floor(
-            col("longitude") / GRID_SIZE
-        ) * GRID_SIZE
-    )
-)
-
-
-grid_stats = (
-    grid_df
-    .groupBy(
-        "grid_lat",
-        "grid_lon"
-    )
-    .agg(
-        count("*").alias("total_crimes")
-    )
-    .withColumn(
-        "grid_lat",
-        spark_round(
-            col("grid_lat"),
-            4
+    city_summary = (
+        city_df
+        .agg(
+            count("*").alias("total_businesses"),
+            spark_sum(
+                when(col("is_open") == 0, 1).otherwise(0)
+            ).alias("closed_businesses"),
+            spark_sum(
+                when(col("is_open") == 1, 1).otherwise(0)
+            ).alias("open_businesses")
+        )
+        .withColumn(
+            "closed_percentage",
+            spark_round(
+                col("closed_businesses")
+                / col("total_businesses") * 100,
+                2
+            )
         )
     )
-    .withColumn(
-        "grid_lon",
-        spark_round(
-            col("grid_lon"),
-            4
+
+    print("\nResumen general:")
+    city_summary.show(truncate=False)
+
+    # ========================================================
+    # 5. PREPARAR CATEGORÍAS
+    # ========================================================
+
+    print("\n4. Separando categorías de Yelp...")
+
+    categories_df = (
+        city_df
+        .filter(col("categories").isNotNull())
+        .withColumn(
+            "category",
+            explode(split(col("categories"), ","))
+        )
+        .withColumn(
+            "category",
+            trim(col("category"))
+        )
+        .filter(col("category") != "")
+        .select(
+            "business_id",
+            "category",
+            "is_open"
+        )
+        .dropDuplicates(["business_id", "category"])
+        .cache()
+    )
+
+    # ========================================================
+    # 6. ESTADÍSTICAS POR CATEGORÍA CON DATAFRAME
+    # ========================================================
+
+    print("\n5. Calculando cierres por categoría...")
+
+    category_stats = (
+        categories_df
+        .groupBy("category")
+        .agg(
+            count("*").alias("total_businesses"),
+            spark_sum(
+                when(col("is_open") == 0, 1).otherwise(0)
+            ).alias("closed_businesses"),
+            spark_sum(
+                when(col("is_open") == 1, 1).otherwise(0)
+            ).alias("open_businesses")
+        )
+        .withColumn(
+            "closed_percentage",
+            spark_round(
+                col("closed_businesses")
+                / col("total_businesses") * 100,
+                2
+            )
         )
     )
-    .orderBy(
-        col("total_crimes").desc()
+
+    category_stats.orderBy(
+        col("total_businesses").desc()
+    ).show(15, truncate=False)
+
+    # ========================================================
+    # 7. MAPREDUCE CON RDD
+    # ========================================================
+
+    print("\n6. Validando resultados con MapReduce...")
+
+    rdd_stats = (
+        categories_df
+        .select("category", "is_open")
+        .rdd
+        .map(
+            lambda row: (
+                row["category"],
+                (
+                    1,
+                    1 if row["is_open"] == 0 else 0,
+                    1 if row["is_open"] == 1 else 0
+                )
+            )
+        )
+        .reduceByKey(
+            lambda a, b: (
+                a[0] + b[0],
+                a[1] + b[1],
+                a[2] + b[2]
+            ),
+            numPartitions=4
+        )
+        .collectAsMap()
     )
-)
 
-print("\nTop hotspots:")
+    dataframe_stats = {
+        row["category"]: (
+            row["total_businesses"],
+            row["closed_businesses"],
+            row["open_businesses"]
+        )
+        for row in category_stats.collect()
+    }
 
-grid_stats.show(
-    20,
-    truncate=False
-)
+    if dict(rdd_stats) != dataframe_stats:
+        raise ValueError(
+            "Los resultados de MapReduce y DataFrame no coinciden."
+        )
 
+    print("VALIDACIÓN EXITOSA:")
+    print("MapReduce y DataFrame producen los mismos resultados.")
 
-# ============================================================
-# 5. GUARDAR HOTSPOTS EN MONGODB
-# ============================================================
+    # ========================================================
+    # 8. PREPARAR RESULTADOS PARA MONGODB
+    # ========================================================
 
-print(
-    f"\n5. Guardando hotspots en "
-    f"{DATABASE_NAME}.{GRID_COLLECTION}..."
-)
+    print("\n7. Preparando resultados...")
 
-(
-    grid_stats
-    .write
-    .format("mongodb")
-    .mode("overwrite")
-    .option("database", DATABASE_NAME)
-    .option("collection", GRID_COLLECTION)
-    .save()
-)
+    output_df = (
+        category_stats
+        .withColumn(
+            "city",
+            lit(SELECTED_CITY)
+        )
+        .withColumn(
+            "metric_type",
+            lit("closure_proportion")
+        )
+        .withColumn(
+            "business_years",
+            lit(None).cast("double")
+        )
+        .withColumn(
+            "closure_rate_per_100_business_years",
+            lit(None).cast("double")
+        )
+        .withColumn(
+            "calculation_status",
+            lit("partial_without_review_dates")
+        )
+        .select(
+            "city",
+            "category",
+            "total_businesses",
+            "open_businesses",
+            "closed_businesses",
+            "closed_percentage",
+            "metric_type",
+            "business_years",
+            "closure_rate_per_100_business_years",
+            "calculation_status"
+        )
+    )
 
-print("Hotspots guardados correctamente.")
+    # ========================================================
+    # 9. GUARDAR EN MONGODB
+    # ========================================================
 
+    print(
+        f"\n8. Guardando en "
+        f"{DATABASE_NAME}.{RESULT_COLLECTION}..."
+    )
 
-# ============================================================
-# 6. VALIDACIÓN
-# ============================================================
+    (
+        output_df
+        .write
+        .format("mongodb")
+        .mode("overwrite")
+        .option("database", DATABASE_NAME)
+        .option("collection", RESULT_COLLECTION)
+        .save()
+    )
 
-monthly_count = monthly_stats.count()
-grid_count = grid_stats.count()
+    print("Resultados guardados correctamente.")
 
-print("\n========================================")
-print("            RESULTADO FINAL")
-print("========================================")
+    # ========================================================
+    # 10. RESUMEN FINAL
+    # ========================================================
 
-print(f"Registros fuente       : {total:,}")
-print(f"Filas temporal         : {monthly_count:,}")
-print(f"Celdas geográficas     : {grid_count:,}")
+    total_categories = output_df.count()
 
-print(
-    f"Colección temporal     : "
-    f"{DATABASE_NAME}.{MONTHLY_COLLECTION}"
-)
+    print("\n" + "=" * 55)
+    print("              RESULTADO FINAL")
+    print("=" * 55)
 
-print(
-    f"Colección espacial     : "
-    f"{DATABASE_NAME}.{GRID_COLLECTION}"
-)
+    print(f"Ciudad: {SELECTED_CITY}")
+    print(f"Negocios analizados: {total_city:,}")
+    print(f"Categorías analizadas: {total_categories:,}")
+    print(f"Colección: {DATABASE_NAME}.{RESULT_COLLECTION}")
 
-print("========================================")
+    print("Validación MapReduce: OK")
 
+    print(
+        "IMPORTANTE: Los resultados corresponden a "
+        "proporciones de cierre, no a tasas por negocio-años."
+    )
 
-spark.stop()
+    print("=" * 55)
+
+finally:
+
+    spark.stop()

@@ -9,6 +9,7 @@ RUN pip install --no-cache-dir \
     numpy \
     pymongo \
     pyarrow \
-    kaggle
+    kaggle \
+    six
 
 COPY . /app
