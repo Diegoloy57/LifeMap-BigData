@@ -1,3 +1,4 @@
+
 pipeline {
 
     agent any
@@ -5,216 +6,131 @@ pipeline {
     options {
         skipDefaultCheckout(true)
         timestamps()
+        disableConcurrentBuilds()
     }
 
     environment {
-        COMPOSE_PROJECT_NAME = 'proyect-bigdata'
+        COMPOSE_PROJECT_NAME = 'lifemap'
+        DOCKER_BUILDKIT = '1'
     }
 
     stages {
 
-        stage('Checkout') {
+        stage('1. Checkout') {
             steps {
-                echo '1. Descargando código desde GitHub...'
+                echo 'Descargando LifeMap desde GitHub...'
                 checkout scm
+
+                script {
+                    env.DEPLOY_COMMIT = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                }
+
+                echo "Commit: ${env.DEPLOY_COMMIT}"
             }
         }
 
-        stage('Validar entorno') {
+        stage('2. Validar Docker') {
             steps {
-                echo '2. Validando Docker y Compose...'
-
                 sh '''
                     docker --version
                     docker compose version
-                    docker compose config --services
+                    docker compose config --quiet
                 '''
             }
         }
 
-        stage('Build imágenes') {
+        stage('3. Construir API') {
             steps {
-                echo '3. Construyendo imágenes Docker...'
+                echo 'Construyendo Flask...'
 
                 sh '''
-                    docker compose build \
-                        dask-client \
-                        dask-scheduler \
-                        dask-worker-1 \
-                        dask-worker-2 \
-                        spark-master \
-                        spark-worker \
-                        api
+                    docker compose build api
                 '''
             }
         }
 
-        stage('Levantar Mongo y Dask') {
+        stage('4. Validar sintaxis') {
             steps {
-                echo '4. Levantando MongoDB y cluster Dask...'
+                echo 'Validando archivos Python...'
 
                 sh '''
-                    docker compose up -d \
-                        mongo \
-                        dask-scheduler \
-                        dask-worker-1 \
-                        dask-worker-2
+                    docker compose run --rm --no-deps \
+                        --entrypoint python api \
+                        -m compileall -q \
+                        api dask spark scripts
                 '''
-
-                sleep 10
             }
         }
 
-        stage('Descargar dataset') {
+        stage('5. Pruebas automatizadas') {
             steps {
+                echo 'Ejecutando pruebas de LifeMap...'
 
-                echo '5. Descargando dataset desde Kaggle...'
+                ssh '''
+                docker compose run --rm --no-deps \
+                --entrypoint python api \
+                -c "import unittest, sys; suite = unittest.defaultTestLoader.discover('tests', pattern='test_lifemap_api.py'); count = suite.countTestCases(); print('Pruebas encontradas:', count); sys.exit(1) if count < 5 else None; result = unittest.TextTestRunner(verbosity=2).run(suite); sys.exit(0 if result.wasSuccessful() else 1)"
+                '''
+            }
+        }
 
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'kaggle-api',
-                        usernameVariable: 'KAGGLE_USERNAME',
-                        passwordVariable: 'KAGGLE_KEY'
-                    )
-                ]) {
+        stage('6. Iniciar MongoDB') {
+            steps {
+                echo 'Iniciando MongoDB LifeMap...'
 
+                sh '''
+                    docker compose up -d --wait mongo
+                '''
+            }
+        }
+
+        stage('7. Desplegar API') {
+            steps {
+                echo 'Desplegando Flask LifeMap...'
+
+                withEnv(["GIT_COMMIT=${env.DEPLOY_COMMIT}"]) {
                     sh '''
-                        docker compose run --rm \
-                            -e KAGGLE_USERNAME \
-                            -e KAGGLE_KEY \
-                            dask-client \
-                            python scripts/download_dataset.py
+                        docker compose up -d --no-deps api
                     '''
                 }
             }
         }
 
-        stage('Ingesta Dask') {
+        stage('8. Smoke test') {
             steps {
-                echo '6. Ejecutando limpieza e ingesta distribuida con Dask...'
+                echo 'Verificando API y MongoDB...'
 
                 sh '''
-                    docker compose run --rm \
-                        dask-client \
-                        python dask/ingest.py
-                '''
-            }
-        }
+                    docker exec lifemap-api python -c '
+import json
+import time
+import urllib.request
 
-        stage('Verificar MongoDB') {
-            steps {
-                echo '7. Verificando registros cargados en MongoDB...'
+url = "http://127.0.0.1:5000/health"
 
-                sh '''
-                    COUNT=$(docker exec bigdata-mongo \
-                        mongosh crime_db \
-                        --quiet \
-                        --eval "db.crimes.countDocuments()")
+for attempt in range(15):
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            data = json.load(response)
 
-                    echo "Registros MongoDB: $COUNT"
+        assert data["status"] == "ok"
+        assert data["database"]["mongodb"] == "connected"
+        assert data["database"]["businesses_estimated"] > 0
 
-                    test "$COUNT" -gt 1000000
-                '''
-            }
-        }
+        print("LifeMap API: OK")
+        print("MongoDB: OK")
+        print("Negocios:", data["database"]["businesses_estimated"])
+        print("Commit:", data["git_commit"])
+        break
 
-        stage('Levantar Spark') {
-            steps {
-                echo '8. Levantando Spark Master y Worker...'
-
-                sh '''
-                    docker compose up -d \
-                        spark-master \
-                        spark-worker
-                '''
-
-                sleep 10
-            }
-        }
-
-        stage('Procesamiento Spark') {
-            steps {
-                echo '9. Ejecutando agregaciones Spark...'
-
-                sh '''
-                    docker exec bigdata-spark-master sh -lc '
-                    /opt/spark/bin/spark-submit \
-                      --master spark://spark-master:7077 \
-                      --packages org.mongodb.spark:mongo-spark-connector_2.12:10.7.0 \
-                      /app/spark/process.py
-                    '
-                '''
-            }
-        }
-
-        stage('Verificar resultados Spark') {
-            steps {
-                echo '10. Verificando colecciones generadas por Spark...'
-
-                sh '''
-                    MONTHLY=$(docker exec bigdata-mongo \
-                        mongosh crime_db \
-                        --quiet \
-                        --eval "db.crime_monthly_area_stats.countDocuments()")
-
-                    HOTSPOTS=$(docker exec bigdata-mongo \
-                        mongosh crime_db \
-                        --quiet \
-                        --eval "db.crime_hotspots_grid.countDocuments()")
-
-                    echo "Agregaciones mensuales: $MONTHLY"
-                    echo "Celdas hotspots: $HOTSPOTS"
-
-                    test "$MONTHLY" -gt 0
-                    test "$HOTSPOTS" -gt 0
-                '''
-            }
-        }
-
-        stage('Deploy API') {
-            steps {
-                echo '11. Desplegando API Flask...'
-
-                sh '''
-                    docker compose up -d api
-                '''
-
-                sleep 5
-            }
-        }
-
-        stage('Pytest') {
-            steps {
-                echo '12. Ejecutando pruebas automatizadas...'
-
-                sh '''
-                    docker compose exec -T api \
-                        pytest -v tests/test_api.py
-                '''
-            }
-        }
-
-        stage('Smoke test') {
-            steps {
-                echo '13. Verificando API desplegada...'
-
-                sh '''
-                    for i in 1 2 3 4 5 6 7 8 9 10
-                    do
-                        if curl --fail --silent \
-                            http://api:5000/health
-                        then
-                            echo
-                            echo "API disponible correctamente"
-                            exit 0
-                        fi
-
-                        echo "Esperando API..."
-                        sleep 3
-                    done
-
-                    echo "ERROR: API no respondió"
-                    exit 1
+    except Exception:
+        if attempt == 14:
+            raise
+        time.sleep(2)
+'
                 '''
             }
         }
@@ -224,22 +140,21 @@ pipeline {
 
         success {
             echo '========================================'
-            echo '        PIPELINE CI/CD EXITOSO'
+            echo '       LIFEMAP CI/CD EXITOSO'
             echo '========================================'
-            echo 'Kaggle  : OK'
-            echo 'Dask    : OK'
-            echo 'MongoDB : OK'
-            echo 'Spark   : OK'
-            echo 'Pytest  : OK'
-            echo 'Flask   : DEPLOYED'
+            echo 'Checkout : OK'
+            echo 'Sintaxis : OK'
+            echo 'Tests    : OK'
+            echo 'MongoDB  : OK'
+            echo 'Flask    : DEPLOYED'
             echo '========================================'
         }
 
         failure {
             echo '========================================'
-            echo 'PIPELINE CI/CD FALLÓ'
-            echo 'El despliegue no se considera válido.'
-            echo 'Revisar la etapa que produjo el error.'
+            echo '        LIFEMAP CI/CD FALLÓ'
+            echo '========================================'
+            echo 'Revisar la etapa que presentó el error.'
             echo '========================================'
         }
     }
