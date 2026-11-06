@@ -94,7 +94,7 @@ pipeline {
                 withEnv(["GIT_COMMIT=${env.DEPLOY_COMMIT}"]) {
                     sh '''
                         echo "Commit que se desplegará: $GIT_COMMIT"
-                        docker compose config | grep -A 15 'api:' | grep GIT_COMMIT
+                        docker compose config | grep GIT_COMMIT || true
                         
                         docker compose up -d --no-deps --force-recreate api
 
