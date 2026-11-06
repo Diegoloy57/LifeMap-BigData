@@ -69,7 +69,7 @@ pipeline {
             steps {
                 echo 'Ejecutando pruebas de LifeMap...'
 
-                ssh '''
+                sh '''
                 docker compose run --rm --no-deps \
                 --entrypoint python api \
                 -c "import unittest, sys; suite = unittest.defaultTestLoader.discover('tests', pattern='test_lifemap_api.py'); count = suite.countTestCases(); print('Pruebas encontradas:', count); sys.exit(1) if count < 5 else None; result = unittest.TextTestRunner(verbosity=2).run(suite); sys.exit(0 if result.wasSuccessful() else 1)"
