@@ -93,7 +93,10 @@ pipeline {
 
                 withEnv(["GIT_COMMIT=${env.DEPLOY_COMMIT}"]) {
                     sh '''
+                        echo "Commit que se desplegará: $GIT_COMMIT"
+                        docker compose config --format json | python3 -c "import json,sys; d=json.load(sys.stdin); print('Commit en Compose:', d['services']['api']['environment'].get('GIT_COMMIT'))"
                         docker compose up -d --no-deps --force-recreate api
+
                     '''
                 }
             }
