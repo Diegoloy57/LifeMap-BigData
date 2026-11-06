@@ -93,7 +93,7 @@ pipeline {
 
                 withEnv(["GIT_COMMIT=${env.DEPLOY_COMMIT}"]) {
                     sh '''
-                        docker compose up -d --no-deps api
+                        docker compose up -d --no-deps --force-recreate api
                     '''
                 }
             }
