@@ -1,8 +1,33 @@
-.git
-.gitignore
-__pycache__
+# Python
+__pycache__/
 *.pyc
-.pytest_cache
-data/raw/*
-data/processed/*
+.pytest_cache/
+.venv/
+venv/
+
+# Datos
+data/raw/
+data/processed/
+*.zip
+*.parquet
+
+# Credenciales
+.env
+.env.*
+!.env.example
+kaggle.json
+access_token
+*.pem
+*.key
+
+# Registros
+*.log
 benchmarks/*.log
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
